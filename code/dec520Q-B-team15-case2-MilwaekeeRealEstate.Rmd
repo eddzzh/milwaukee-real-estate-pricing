@@ -1,0 +1,470 @@
+---
+title: "dec520Q-B-team15-case2-MilwaukeeRealEstate"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(DataExplorer)
+library(GGally)
+library(Hmisc)
+library(ggpubr)
+library(MASS)
+library(corrgram)
+library(ggExtra)
+```
+
+## Introduction (5 min)
+
+**Business Context.** Real estate markets can sometimes be irrational, and buying a house can certainly be an emotional and highly psychological process. For example, the asking price can [“anchor”](https://en.wikipedia.org/wiki/Anchoring) the negotiations, and it can be very hard as a buyer to “forget” that initial number.
+
+You are a property developer who frequently buys properties. It would be very useful to get a fair estimate of the price of a property before seeing the asking price, based on features like its size and location. Besides making you a more informed buyer, having a pricing model could have multiple uses, such as automatically detecting under-priced properties that come on the market, or estimating the value added to a property if it was extended, divided into apartments, or converted into offices.
+
+**Business Problem.** Your task is to **build a model to predict property prices in the city of Milwaukee, Wisconsin**.
+
+## Data Exploration & Processing
+
+Let's start by taking a look at the available features:
+
+1. **PropType**: the property category (“Commercial”, “Residential”, “Lg Apartment”, “Vacant Land”, or “Condominium”)
+2. **Taxkey**: a unique identifier for the property
+3. **Address**: the street address of the property
+4. **CondoProject**: for condominiums, the name of the project
+5. **District**: integer between 1 and 15 identifying the city district
+6. **Nbhd**: integer identifying one of 591 neighborhoods
+7. **Style**: information about the building architectural style, commerical use or type of building
+8. **Extwall**: type of exterior wall (e.g. “Brick”)
+9. **Stories**: number of stories
+10. **Year_Built**: the year the building was built
+11. **Nr_of_rms**: number of rooms
+12. **Fin_sqft**: finished square feet
+13. **Units**: number of units (e.g. apartments) in the building
+14. **Bdrms**: number of bedrooms
+15. **Fbath**: number of full bathrooms
+16. **Hbath**: number of half bathrooms
+17. **Lotsize**: size of the lot in square feet
+18. **Sale_date**: the date of the sale in YYYY-MM-DD format
+19. **Sale_price**: sale price in US dollars
+
+
+```{r}
+data <- read.csv("2002-2018-property-sales-data.csv", header=TRUE)
+data$Sale_date <- as.character(data$Sale_date)
+data$Sale_date <- parse_date(data$Sale_date, format="%Y-%m")
+glimpse(data)
+```
+Some tips:
+
+1. For the sake of removing potential confounding factors from consideration, focus on residential properties only (commercial properties are subject to all sorts of economic and market forces that residential properties are not). Also feel free to filter out other variables
+too (such as properties only above year 1800 etc).
+2. Pay attention to missing values. Sometimes missing numbers are entered as zeros, which can mess up the analysis (see `Lotsize` below as an example). Before proceeding, remove rows with zeros in `Year_Built`, `Fin_sqft`, `Lotsize`, and `Sale_price`, as these are the numerical variables where erroneous zero values can skew the distribution.
+
+
+```{r}
+# filter out undesirable rows as advised by tips above
+data2 <- data %>%
+  filter(PropType == "Residential" & Year_Built != 0 & Fin_sqft != 0 & Lotsize != 0 & Sale_price != 0)
+glimpse(data2)
+```
+
+As the first step of data processing, let's take out variables that are obviously redundant
+
+1. Drop `PropType` since we are only investigating residential real estates
+2. Drop irrelevant variables including `Taxkey`, `CondoProject` (all missing values)
+3. Drop confounding size variables including `Nr_of_rms`, `Bdrms`, `Fbath`, `Hbath` `Fin_sqft` nicely measures size dimension of properties.
+4. Drop `Address` because this is a descriptive character variable and does not provide inferential value for building a predictive model. For now, we use `District` and `Nbhd` to factor in the geographical effect on sale price.
+
+```{r}
+data2 <- data2 %>% dplyr::select(-PropType, -Taxkey, -CondoProject, -Nr_of_rms, -Bdrms, -Fbath, -Hbath, -Address)
+glimpse(data2)
+```
+
+We are now left with 11 variables, which can roughly be categorized into four categories
+
+1. Descriptive: `Style`, `Extwall`, `Year_Built`
+2. Size: `Stories`, `Fin_sqft`, `Units`, `Lotsize`
+3. Geographical: `District`, `Nbhd`
+4. Sale: `Sale_date`, `Sale_price`
+
+There are certainly redundancy in each category. For instance, it's reasonable to hypothesize that `Stories` and `Fin_sqft` are confounding variables since they both measure the size of the residential property. We expect they are highly correlated and have a linear relationship. If this is the case, we will consider dropping one of the two in model fitting.
+
+### 1-D Distribution
+
+```{r}
+plot_histogram(data2)
+```
+
+Using a wrapper function to make my life easier, this lousy panel of histogram shows some good and bad news from the numeric variables.
+
+Good News:
+
+1. `District` and `Nbhd` have spiky patterns resembling each other. This may imply that lower `District` values correspond to lower `Nbhd` values and vice versa. Consider droping one of these two to keep only one geographical variable before fitting a model.
+2. `Year_Built` has a somewhat bell-shaped distribution. Feeding the raw data into a linear regression model shouldn't be problematic although rows with extreme values will be considered to be removed.
+
+Bad News:
+
+1. The distribution of `Fin_sqft`, `Lotsize`, `Sale-price`, and `Units` are spiky at lower values. This may imply that extreme but rare values are distorting the histogram shape. Consider decide on threshold values to remove rows with extreme values in these variables.
+
+```{r}
+describe(data2)
+```
+**What do we learn from the summary statistics above?**
+
+* For `Sale_price` and `Fin_sqft`, there are lots of extreme values on both tails below 5th and above 95th percentile. This implies that there are relatively outrageous houses contained in the dataset -- either super tiny or super large mansions. However, we do not think these houses are outrageous enough to me labeled as outliers destined to be excluded because we have seen houses that are way above 6 million dollars in the Seattle housing case and NYC Airbnb case. In this case, these extreme values may be small enough to be addressed via transformation, but this hypothesis needs to be confirmed.
+
+### 2-D Distribution
+
+#### Correlation analysis
+
+We construct a comprehensive correlograms to include all numeric values from the data set. This might be redundant but it would not hurt to know more.
+
+```{r}
+# Create a sequence of boolean values to indicate the numeric values
+data3 <- data %>%
+  filter(PropType == "Residential" & Year_Built != 0 & Fin_sqft != 0 & Lotsize != 0 & Sale_price != 0)
+numVar = unlist(lapply(data3, is.numeric))
+ggcorr(data3[,numVar], label=TRUE, hjust=0.73, label_size=4, label_round=2 , legend.position=c(0.1, 0.8))
+```
+
+**Interpretation: ** 
+
+1. The high correlation values among variables that describe size of residential properties validate our choice of only keeping `Fin_sqft` to model the effect of size on sale price.
+2. As expected, the two geographical variables, `District` and `Nbhd`, are highly correlated (correlation = 0.71). Similarly, the two variables that measure size, `Stories` and `Fin_sqft`, are also highly correlated (correlation = 0.69). In addition, there are observable linear relationship in the two pairs of variables as demonstrated in scatter plots below. To avoid multicollinearity, one variable in each pair will be dropped. We would prefer `Nbhd` over `District` and `Fin_sqft` over `Stores` because of the former two variables are more granular and contain more information for model fitting.
+3. `Units` correlates to `Fin_sqft` and `Stories` with correlation = 0.53 but we do not feel confident to treat it as a confounding variable let alone dropping it because rather than the individual size of each property, `Unit` measures the overall size of the apartment complex, which may explain more variation in price.
+
+The following two scatter plot demonstrate the confounding effects in two pairs of variables mentioned above.
+
+```{r}
+ggplot(data2, aes(District, Nbhd)) + geom_point() + geom_smooth(method=lm)
+```
+```{r}
+ggplot(data2, aes(Stories, Fin_sqft)) +geom_point() + geom_smooth(method=lm)
+```
+
+```{r}
+numVar2 = unlist(lapply(data2, is.numeric))
+corrgram(data2[,numVar2], order=TRUE, lower.panel=panel.ellipse, upper.panel=panel.pts, text.panel=panel.txt, diag.panel=panel.minmax, main="Correlogram of variables in Milwaukee dataset")
+```
+
+
+#### Box plot analysis
+
+**Note: **Since correlation matrix is not friendly to factor variables, we use box plots to examine the effect of categorical variables on sale price. Note that we are treating `Districts`, `Units`, and `Stories` as categorical variables here because they only have few distinct values and is manageable by box plots.
+
+```{r}
+data2 %>%
+  dplyr::select(Style, Sale_price) %>%
+  mutate(Style = fct_reorder(Style, Sale_price, .fun = "median", .desc = T)) %>% 
+  ggplot(aes(Style, Sale_price, fill=Style)) +
+  geom_boxplot(alpha=0.8) +
+  theme(axis.text.x = element_text(hjust=1, size = 12),
+        axis.text.y = element_text(size=10),
+        legend.position = "none") +
+  coord_flip() +
+  ggtitle("Distribution of sale price by Style")
+```
+
+
+```{r}
+data2 %>%
+  dplyr::select(Extwall, Sale_price) %>%
+  mutate(Extwall = fct_reorder(Extwall, Sale_price, .fun = "median", .desc = T)) %>% 
+  ggplot(aes(Extwall, Sale_price, fill=Extwall)) +
+  geom_boxplot(alpha=0.8) +
+  theme(axis.text.x = element_text(hjust=1, size = 12),
+        axis.text.y = element_text(size=10),
+        legend.position = "none") +
+  coord_flip() +
+  ggtitle("Distribution of sale price by Extwall")
+```
+
+
+
+```{r}
+data2 %>%
+  dplyr::select(District, Sale_price) %>%
+  mutate(District = fct_reorder(factor(District), Sale_price, .fun = "median", .desc = T)) %>% 
+  ggplot(aes(District, Sale_price, fill=District)) +
+  geom_boxplot(alpha=0.8) +
+  theme(axis.text.x = element_text(hjust=1, size = 12),
+        axis.text.y = element_text(size=10),
+        legend.position = "none") +
+  coord_flip() +
+  ggtitle("Distribution of sale price by District")
+```
+```{r}
+data2 %>%
+  dplyr::select(Units, Sale_price) %>%
+  ggplot(aes(factor(Units), Sale_price, fill=factor(Units))) +
+  geom_boxplot(alpha=0.8) +
+  theme(axis.text.x = element_text(hjust=1, size = 12),
+        axis.text.y = element_text(size=10),
+        legend.position = "none") +
+  coord_flip() +
+  ggtitle("Distribution of sale price by Units")
+```
+```{r}
+data2 %>%
+  dplyr::select(Stories, Sale_price) %>%
+  mutate(Stories = fct_reorder(factor(Stories), Sale_price, .fun = "median", .desc = T)) %>% 
+  ggplot(aes(Stories, Sale_price, fill=Stories)) +
+  geom_boxplot(alpha=0.8) +
+  theme(axis.text.x = element_text(hjust=1, size = 12),
+        axis.text.y = element_text(size=10),
+        legend.position = "none") +
+  coord_flip() +
+  ggtitle("Distribution of sale price by Stories")
+```
+
+**Interpretation: ** Looking at the boxplots, all of the selected categorical variables have effects on `Sale_price`, although not necessarily all ordinal.
+
+
+### Transformation
+
+As shown in the lousy panel of histogram above, two of the distributions are apparently right skewed -- `Sale_price` and `Fin_sqft`. Thus, before fitting a model, we perform two appropriate transformations to get the data into right shape. Box-cox and QQ plot will be used to help to make the decision.
+```{r}
+#Supress scientific notation
+options(scipen=999)
+```
+
+```{r}
+c = ggplot(data2, aes(Sale_price)) +
+        geom_histogram(aes(y=..density..), bins=40) +
+        scale_x_continuous(labels=function(x){x/10^6})+
+        geom_density() + ggtitle("Histogram of raw Sale_price")
+c1 = data2 %>%
+  ggplot(aes(sample=Sale_price)) + stat_qq() + stat_qq_line() + ggtitle("QQ plot of raw Sale_price")
+c2 = data2 %>%
+  ggplot(aes(sample=sqrt(Sale_price))) + stat_qq() + stat_qq_line() + ggtitle("QQ plot of SQRT(Sale_price)")
+c3 = data2 %>%
+  ggplot(aes(sample=log(Sale_price))) + stat_qq() + stat_qq_line() + ggtitle("QQ plot of LOG(Sale_price)")
+ggarrange(c, c1, c2, c3, ncol=2, nrow=2)
+```
+
+```{r}
+d = ggplot(data2, aes(Fin_sqft)) +
+        geom_histogram(aes(y=..density..), bins=40) +
+        scale_x_continuous(labels=function(x){x/10^6})+
+        geom_density() + ggtitle("Histogram of raw Fin_sqft")
+d1 = data2 %>%
+  ggplot(aes(sample=Fin_sqft)) + stat_qq() + stat_qq_line() + ggtitle("QQ plot of raw Fin_sqft")
+d2 = data2 %>%
+  ggplot(aes(sample=sqrt(Fin_sqft))) + stat_qq() + stat_qq_line() + ggtitle("QQ plot of SQRT(Fin_sqft)")
+d3 = data2 %>%
+  ggplot(aes(sample=log(Fin_sqft))) + stat_qq() + stat_qq_line() + ggtitle("QQ plot of LOG(Fin_sqft)")
+ggarrange(d, d1, d2, d3, ncol=2, nrow=2)
+```
+**QQ Plot Analysis:** 
+
+* For `Sale_price`, neither of the two transformation makes more sense in terms of fitting a better QQ plot, although SQRT transformation performed relatively better on the left tail than log transformation. For the SQRT transformation, left tail seems fine but right tail is just too far off the theoretical line. It's unclear which transformation is better just from looking at QQ plots. Consider use box-cox, a more concrete proxy, to decide on the transformation.
+* For `Fin_sqft`, it is appears that log transformation has a better fit than SQFT transformation. However, we cannot be sure because both tails are off the theoretical line.
+
+
+## Model Fit
+
+We will attempt to predict `Sale_price` with following variables.
+
+1. `Fin_sqft`: Size is the most basic consideration in the real state business
+2. `Lotsize`: With a larger lot size you have more room for outdoor entertaining on a deck, patio or pool, a privacy buffer from neighbors, space for a garden or for expanding your home and room for romping with kids and grandkids.
+3. `Year_Built`: Older houses might be less appealing.
+4. factor(`District`): As we saw in box plot, geographical distribution has a clear impact on price. (Note: we prefer `District` over `Nbhd` because the former is more managable in terms of the number of distinct values.
+5. factor(`Unit`) measures the overall size of the apartment complex, which may explain additional variation in price over `Fin_sqft`.
+
+Along the way as the model involves more complexity, we will justify each transformation using **box-cox test** and the addition of each variable using **AIC test**. 
+
+```{r}
+# Raw box-cox of linear model of price and size
+b1 <- boxcox(lm(Sale_price~log(Fin_sqft), data = data2))
+round(b1$x[which(b1$y == max(b1$y))], 2)
+```
+
+```{r}
+# box-cox of linear model of sqrt(price) and size
+b2 <- boxcox(lm(sqrt(Sale_price)~log(Fin_sqft), data = data2))
+round(b2$x[which(b2$y == max(b2$y))], 2)
+```
+
+```{r}
+# box-cox of linear model of sqrt(price) and sqrt(size)
+b3 <- boxcox(lm(log(Sale_price)~log(Fin_sqft), data = data2))
+round(b3$x[which(b3$y == max(b3$y))], 2)
+```
+
+```{r}
+b4 <- boxcox(lm(sqrt(Sale_price)~Fin_sqft, data = data2))
+round(b4$x[which(b4$y == max(b4$y))], 2)
+```
+```{r}
+b5 <- boxcox(lm(sqrt(Sale_price)~sqrt(Fin_sqft), data = data2))
+round(b5$x[which(b5$y == max(b5$y))], 2)
+```
+
+```{r}
+b6 <- boxcox(lm(log(Sale_price)~sqrt(Fin_sqft), data = data2))
+round(b6$x[which(b6$y == max(b6$y))], 2)
+```
+
+```{r}
+a1 = ggplot(data2, aes(x=Fin_sqft, y=Sale_price)) + 
+  geom_point(alpha=0.4, size=0.3) + geom_smooth(method=lm) + 
+  ggtitle("Sale_price vs. Fin_sqft")
+a2 = ggplot(data2, aes(x=Fin_sqft, y=sqrt(Sale_price))) + 
+  geom_point(alpha=0.4, size=0.3) + geom_smooth(method=lm) + 
+  ggtitle("SQRT(Sale_price) vs. Fin_sqft")
+a3 = ggplot(data2, aes(x=Fin_sqft, y=sqrt(Sale_price))) + 
+  geom_point(alpha=0.4, size=0.3) + geom_smooth(method=lm) + 
+  ggtitle("SQRT(Sale_price) vs. SQRT(Fin_sqft)")
+a4 = ggplot(data2, aes(x=Fin_sqft, y=sqrt(Sale_price))) + 
+  geom_point(alpha=0.4, size=0.3) + geom_smooth(method=lm) + 
+  ggtitle("SQRT(Sale_price) vs. LOG(Fin_sqft)")
+ggarrange(a1, a2, a3, a4, nrow=2, ncol=2)
+```
+
+**Scatter plot interpretation: ** The scatter plots of different combinations of transformed variables offer little more insights on which one performs better; they are equally good. Hence, we will choose the one with lamda value closest to 1 -- SQRT(Sale_price) vs. Fin_sqft.
+
+```{r}
+m1 = lm(sqrt(Sale_price)~Fin_sqft, data = data2)
+summary(m1)
+AIC(m1)
+b1.1 <- boxcox(m1)
+cat("\nBox-cox lamda:  ", b1.1$x[which.max(b1.1$y)])
+```
+```{r}
+m2 = lm(sqrt(Sale_price)~Fin_sqft + Lotsize, data = data2)
+summary(m2)
+cat("AIC:            ", AIC(m2))
+b7 <- boxcox(m2)
+cat("\nBox-cox lamda:  ", b7$x[which.max(b7$y)])
+```
+
+```{r}
+m3 = lm(sqrt(Sale_price)~Fin_sqft + Lotsize + Year_Built, data = data2)
+summary(m3)
+cat("AIC:            ", AIC(m3))
+b8 <- boxcox(m3)
+cat("\nBox-cox lamda:  ", b8$x[which.max(b8$y)])
+```
+
+```{r}
+m4 = lm(sqrt(Sale_price)~Fin_sqft + Lotsize + Year_Built + factor(District), data = data2)
+summary(m4)
+cat("AIC:            ", AIC(m4))
+b9 <- boxcox(m4)
+cat("\nBox-cox lamda:  ", b9$x[which.max(b9$y)])
+```
+
+```{r}
+m5 = lm(sqrt(Sale_price)~Fin_sqft + Lotsize + Year_Built + factor(District) + factor(Units), data = data2)
+summary(m5)
+cat("AIC:            ", AIC(m5))
+b10 <- boxcox(m5)
+cat("\nBox-cox lamda:  ", b10$x[which.max(b10$y)])
+```
+
+```{r}
+m5.1 = lm(sqrt(Sale_price)~Fin_sqft + Lotsize + Year_Built + factor(District) + factor(Units) + factor(Extwall), 
+          data = data2)
+summary(m5.1)
+cat("AIC:            ", AIC(m5.1))
+b10.1 <- boxcox(m5.1)
+cat("\nBox-cox lamda:  ", b10.1$x[which.max(b10.1$y)])
+```
+
+### Interaction Effect
+
+```{r}
+e1 = ggplot(data2, aes(x=Fin_sqft, y=sqrt(Sale_price), color=Style)) +
+  geom_point(alpha=0.4, size=0.4) +
+  geom_smooth(formula=y~x, method=lm, se=F) +
+  ggtitle("Interaction effect - SQRT(price) vs. size by Styles") +
+  xlab("Size (sq. ft.)") + ylab("SQRT(price)") +
+  scale_color_manual(values = c('#00429d', '#2b57a7', '#426cb0', '#5681b9', '#6997c2', '#7daeca', '#93c4d2', '#abdad9', '#caefdf', '#e1e14d', '#eac341', '#eca639', '#ea8833', '#e36b2f', '#d74e2f', '#c63130', '#b01334', '#93003a')) +
+  theme(legend.position="left")
+ggMarginal(e1, type="density")
+```
+```{r}
+e2 = ggplot(data2, aes(x=Fin_sqft, y=sqrt(Sale_price), color=factor(Units))) +
+  geom_point(alpha=0.4, size=0.4) +
+  geom_smooth(formula=y~x, method=lm, se=F) +
+  ggtitle("Interaction effect - SQRT(price) vs. size by Units") +
+  xlab("Size (sq. ft.)") + ylab("SQRT(price)") +
+  scale_color_manual(values = c('#00429d', '#4771b2', '#73a2c6', '#a5d5d8', '#ffffe0', '#ebbc3f', '#e77931', '#cb3830', '#93003a')) +
+  theme(legend.position="left")
+ggMarginal(e2, type="density")
+```
+
+```{r}
+e3 = ggplot(data2, aes(x=Fin_sqft, y=sqrt(Sale_price), color=factor(District))) +
+  geom_point(alpha=0.4, size=0.4) +
+  geom_smooth(formula=y~x, method=lm, se=F) +
+  ggtitle("Interaction effect - SQRT(price) vs. size by District") +
+  xlab("Size (sq. ft.)") + ylab("SQRT(price)") +
+  scale_color_manual(values = c('#00429d', '#325da9', '#4e78b5', '#6694c1', '#80b1cc', '#9dced6', '#c0eade', '#ffffe0', '#e4d849', '#ecb23c', '#ea8c33', '#e1672f', '#d0412f', '#b71c32', '#93003a')) +
+  theme(legend.position="left")
+ggMarginal(e3, type="density")
+```
+
+```{r}
+e4 = ggplot(data2, aes(x=Fin_sqft, y=sqrt(Sale_price), color=factor(Stories))) +
+  geom_point(alpha=0.4, size=0.4) +
+  geom_smooth(formula=y~x, method=lm, se=F) +
+  ggtitle("Interaction effect - SQRT(price) vs. size by Stories") +
+  xlab("Size (sq. ft.)") + ylab("SQRT(price)") +
+  scale_color_manual(values = c('#00429d', '#5681b9', '#93c4d2', '#eca639', '#d74e2f', '#93003a')) +
+  theme(legend.position="left")
+ggMarginal(e4, type="density")
+```
+
+```{r}
+m6 = lm(sqrt(Sale_price)~Fin_sqft + Lotsize + Year_Built + factor(Units) + 
+          Fin_sqft*factor(District), data = data2)
+summary(m6)
+cat("AIC:            ", AIC(m6))
+b11 <- boxcox(m6)
+cat("\nBox-cox lamda:  ", b11$x[which.max(b11$y)])
+```
+
+```{r}
+m7 = lm(sqrt(Sale_price)~Fin_sqft + Lotsize + Year_Built + factor(Units) + 
+          Fin_sqft*factor(District) + Fin_sqft*factor(Stories), data = data2)
+summary(m7)
+cat("AIC:            ", AIC(m7))
+b12 <- boxcox(m7)
+cat("\nBox-cox lamda:  ", b12$x[which.max(b12$y)])
+```
+
+```{r}
+m8 = lm(sqrt(Sale_price)~Fin_sqft + Lotsize + Year_Built + factor(Units) + 
+          Fin_sqft*factor(District) + Fin_sqft*factor(Stories) + Fin_sqft*Style, data = data2)
+summary(m8)
+cat("AIC:            ", AIC(m8))
+b13 <- boxcox(m8)
+cat("\nBox-cox lamda:  ", b13$x[which.max(b13$y)])
+```
+
+**Note: **At this point, all model fitting attempts *based on EDA* has been completed. The following model fits are purely for optimizing R-squared while not sabotaging AIC.
+
+```{r}
+m9 = lm(sqrt(Sale_price)~Fin_sqft + Lotsize + Year_Built + factor(Units) + 
+          Fin_sqft*factor(Nbhd) + Fin_sqft*factor(Stories) + Fin_sqft*Style, data = data2)
+summary(m9)
+cat("AIC:            ", AIC(m9))
+b14 <- boxcox(m9)
+cat("\nBox-cox lamda:  ", b14$x[which.max(b14$y)])
+```
+
+**Model Selection: ** It appears that `Nbhd` is a much better geographical variable for explaining variation in price than `District` to obtain the highest R-squared out of the nine models we've fitted. However, there are too many levels that do not add significance in model 9, and therefore we should be cautious of of variance-bias trade-off problem. If we were to feel confident about deploying the model into use, model 5 would be a safer choice since it most of the explanatory variables are significant at 95% confidence level, and geographical element is explained by `District`.
+
+## Model Evaluation
+
+```{r}
+par(mfrow = c(2,2))
+plot(m5)
+```
+
+**Interpretation: **
+
+1. The Residual vs Fitted plot indicates that the mean of ε is very close to zero. Most of the observations’ residuals are spreading randomly around the 0 line, that means the relationship is linear and there are very few outliers in our model.
+2. Although observation 6714 is way off the theoretical line, our Normal Q-Q plot shows an approximate straight-line indicating a normal distribution in residuals of predicted and observed price. 
+3. The Scale-Location plot indicates an equal spread in variance across fitted Sale_price. Therefore, our model has met the homoscedasticity assumption of linear regression models. 
+4. Additionally, not all outliers are influential to our model fit as indicated by Residual vs. Leverage plot, where all cases are well within the cook’s distance line except observation #6714 If we exclude observation #6714 from the regression model, R2increases by 0.001, which is not significant.
